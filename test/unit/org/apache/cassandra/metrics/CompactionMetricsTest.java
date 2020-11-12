@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.metrics;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -26,11 +27,12 @@ import java.util.UUID;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.Sets;
-import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.DisallowedDirectories;
 import org.apache.cassandra.db.compaction.ActiveCompactionsTracker;
 import org.apache.cassandra.db.compaction.CompactionController;
 import org.apache.cassandra.db.compaction.CompactionInfo;
@@ -43,17 +45,21 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.MockSchema;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 public class CompactionMetricsTest extends CQLTester
 {
+    private static final CompactionManager compactionManager = CompactionManager.instance;
+
     @Test
     public void testSimpleCompactionMetricsForCompletedTasks() throws Throwable
     {
 
-        final long initialCompletedTasks = CompactionManager.instance.getCompletedTasks();
-        Assert.assertEquals(0L, CompactionManager.instance.getTotalCompactionsCompleted());
-        Assert.assertEquals(0L, CompactionManager.instance.getTotalBytesCompacted());
+        final long initialCompletedTasks = compactionManager.getCompletedTasks();
+        assertEquals(0L, compactionManager.getTotalCompactionsCompleted());
+        assertEquals(0L, compactionManager.getTotalBytesCompacted());
 
         this.createTable("CREATE TABLE %s (pk int, ck int, a int, b int, PRIMARY KEY (pk, ck))");
         this.getCurrentColumnFamilyStore().disableAutoCompaction();
@@ -65,9 +71,9 @@ public class CompactionMetricsTest extends CQLTester
         this.getCurrentColumnFamilyStore().forceBlockingFlush();
         this.getCurrentColumnFamilyStore().forceMajorCompaction();
 
-        Assert.assertEquals(1L, CompactionManager.instance.getTotalCompactionsCompleted());
-        Assert.assertTrue(CompactionManager.instance.getTotalBytesCompacted() > 0L);
-        Assert.assertTrue(initialCompletedTasks < CompactionManager.instance.getCompletedTasks());
+        assertEquals(1L, compactionManager.getTotalCompactionsCompleted());
+        assertTrue(compactionManager.getTotalBytesCompacted() > 0L);
+        assertTrue(initialCompletedTasks < compactionManager.getCompletedTasks());
     }
 
     @Test
@@ -77,21 +83,12 @@ public class CompactionMetricsTest extends CQLTester
         final List<SSTableReader> sstables = this.createSSTables(cfs, 10, 0);
         final Set<SSTableReader> toMarkCompacting = new HashSet<>(sstables.subList(0, 3));
         final TestCompactionTask tct = new TestCompactionTask(cfs, toMarkCompacting);
-        final long initialPendingTasks = CompactionManager.instance.getMetrics().pendingTasks.getValue();
+        final long initialPendingTasks = compactionManager.getMetrics().pendingTasks.getValue();
         try
         {
             tct.start();
-            final List<CompactionInfo.Holder> activeCompactions = this.getActiveCompactionsForTable(cfs);
-            Assert.assertEquals(1L, activeCompactions.size());
-            Assert.assertEquals(activeCompactions.get(0).getCompactionInfo().getSSTables(), toMarkCompacting);
-            cfs.runWithCompactionsDisabled(() -> null, sstable -> !toMarkCompacting.contains(sstable), false, false, true);
-            Assert.assertEquals(1L, activeCompactions.size());
-            Assert.assertFalse(activeCompactions.get(0).isStopRequested());
-
-            // logger.info("testing data: {} {} {}", initialPendingTasks, CompactionManager.instance.getMetrics().pendingTasks.getValue(), CompactionManager.instance.getMetrics().pendingTasksByTableName.getValue().containsKey(cfs.keyspace.getName()));
-            Assert.assertTrue(CompactionManager.instance.getMetrics().pendingTasksByTableName.getValue().containsKey(cfs.keyspace.getName()));
-            Assert.assertTrue(CompactionManager.instance.getMetrics().pendingTasks.getValue() > initialPendingTasks);
-            logger.info("finish testing");
+            assertTrue(compactionManager.getMetrics().pendingTasksByTableName.getValue().containsKey(cfs.keyspace.getName()));
+            assertTrue(compactionManager.getMetrics().pendingTasks.getValue() > initialPendingTasks);
         }
         finally
         {
@@ -100,36 +97,61 @@ public class CompactionMetricsTest extends CQLTester
     }
 
     @Test
-    public void testCompactionMetricsForFailedTasks()
+    public void testCompactionMetricsForCompactionsAborted() throws Throwable
     {
+        createTable("create table %s (id int, id2 int, t text, primary key (id, id2))");
+        execute("insert into %s (id, id2) values (1, 1)");
+        execute("insert into %s (id, id2) values (2, 2)");
+        execute("insert into %s (id, id2) values (3, 3)");
+        flush();
+        int size = this.execute("select id from %s").size();
 
-        Assert.assertEquals(0, CompactionManager.instance.getMetrics().compactionsAborted.getCount());
-        Assert.assertEquals(0, CompactionManager.instance.getMetrics().compactionsReduced.getCount());
-        Assert.assertEquals(0, CompactionManager.instance.getMetrics().sstablesDropppedFromCompactions.getCount());
+        for (int i = 0; i < 10; i++)
+        {
+            execute("delete from %s where id=? and id2=?", i, i);
+        }
+        flush();
 
+        for (int i = 10; i < 20; i++)
+        {
+            execute("delete from %s where id=? and id2=?", i, i);
+        }
+        flush();
 
-        final ColumnFamilyStore cfs = MockSchema.newCFS();
-        final List<SSTableReader> sstables = this.createSSTables(cfs, 10, 0);
-        final Set<SSTableReader> toMarkCompacting = new HashSet<>(sstables.subList(0, 3));
-        final CompactionMetricsTest.TestCompactionTask tct = new CompactionMetricsTest.TestCompactionTask(cfs, toMarkCompacting);
+        for(File dir : getCurrentColumnFamilyStore().getDirectories().getCFDirectories()){
+            DisallowedDirectories.maybeMarkUnwritable(dir);
+        }
+
         try
         {
-            tct.start2();
-            final List<CompactionInfo.Holder> activeCompactions = this.getActiveCompactionsForTable(cfs);
-            Assert.assertEquals(1L, activeCompactions.size());
-            Assert.assertEquals(activeCompactions.get(0).getCompactionInfo().getSSTables(), toMarkCompacting);
-            cfs.runWithCompactionsDisabled(() -> null, sstable -> !toMarkCompacting.contains(sstable), false, false, true);
-            Assert.assertEquals(1L, activeCompactions.size());
-            Assert.assertFalse(activeCompactions.get(0).isStopRequested());
+            getCurrentColumnFamilyStore().forceMajorCompaction();
         }
-        finally
+        catch (Exception e){
+            logger.info("Exception Thrown when compacting with unwritable directories.");
+        }
+        assertTrue(compactionManager.getMetrics().compactionsAborted.getCount() > 0);
+    }
+
+    @Test
+    public void testCompactionMetricsForFailedTasks () throws Throwable
+    {
+        this.createTable("CREATE TABLE %s (pk int, ck int, a int, b int, PRIMARY KEY (pk, ck))");
+        this.getCurrentColumnFamilyStore().disableAutoCompaction();
+        for (int i = 0; i < 10; ++i)
         {
-            tct.abort();
+            this.execute("INSERT INTO %s (pk, ck, a, b) VALUES (" + i + ", 2, 3, 4)");
         }
 
-        Assert.assertTrue(CompactionManager.instance.getMetrics().compactionsAborted.getCount() > 0);
-        Assert.assertTrue(CompactionManager.instance.getMetrics().compactionsReduced.getCount() > 0);
-        Assert.assertTrue(CompactionManager.instance.getMetrics().sstablesDropppedFromCompactions.getCount() > 0);
+        Directories dr = getCurrentColumnFamilyStore().getDirectories();
+        for(File dir : dr.getCFDirectories()){
+            logger.info("{} write permission, yes? {}", dir.getAbsolutePath(), !DisallowedDirectories.isUnwritable(dir));
+        }
+
+        this.getCurrentColumnFamilyStore().forceBlockingFlush();
+        this.getCurrentColumnFamilyStore().forceMajorCompaction();
+
+        assertTrue(CompactionManager.instance.getMetrics().compactionsReduced.getCount() > 0);
+        assertTrue(CompactionManager.instance.getMetrics().sstablesDropppedFromCompactions.getCount() > 0);
     }
 
     private List<SSTableReader> createSSTables(ColumnFamilyStore cfs, int count, int startGeneration)
@@ -148,7 +170,7 @@ public class CompactionMetricsTest extends CQLTester
 
     private List<CompactionInfo.Holder> getActiveCompactionsForTable(ColumnFamilyStore cfs)
     {
-        return CompactionManager.instance.active.getCompactions()
+        return compactionManager.active.getCompactions()
                                                 .stream()
                                                 .filter(holder -> holder.getCompactionInfo().getTable().orElse("unknown").equalsIgnoreCase(cfs.name))
                                                 .collect(Collectors.toList());
@@ -157,7 +179,7 @@ public class CompactionMetricsTest extends CQLTester
     private static class TestCompactionTask
     {
         private final Set<SSTableReader> sstables;
-        ActiveCompactionsTracker activeCompactions = CompactionManager.instance.active;
+        ActiveCompactionsTracker activeCompactions = compactionManager.active;
         OperationType compactionType = OperationType.COMPACTION;
         private final ColumnFamilyStore cfs;
         private LifecycleTransaction txn;
@@ -178,18 +200,6 @@ public class CompactionMetricsTest extends CQLTester
             assertNotNull(txn);
             controller = new CompactionController(cfs, sstables, Integer.MIN_VALUE);
             ci = new CompactionIterator(txn.opType(), scanners, controller, FBUtilities.nowInSeconds(), UUID.randomUUID());
-            activeCompactions.beginCompaction(ci);
-        }
-
-        public void start2()
-        {
-            scanners = sstables.stream().map(SSTableReader::getScanner).collect(Collectors.toList());
-            txn = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);
-            assertNotNull(txn);
-            controller = new CompactionController(cfs, sstables, Integer.MIN_VALUE);
-            ci = new CompactionIterator(txn.opType(), scanners, controller, FBUtilities.nowInSeconds(), UUID.randomUUID());
-            final Set<SSTableReader> fullyExpiredSSTables = controller.getFullyExpiredSSTables();
-            dropExpiredSSTables(fullyExpiredSSTables);
             activeCompactions.beginCompaction(ci);
         }
 
@@ -214,15 +224,15 @@ public class CompactionMetricsTest extends CQLTester
 
             while (nonExpiredSSTablesSize > 1)
             {
-                CompactionManager.instance.incrementAborted();
+                compactionManager.incrementAborted();
                 nonExpiredSSTablesSize--;
                 sstablesRemoved++;
             }
 
             if (sstablesRemoved > 0)
             {
-                CompactionManager.instance.incrementCompactionsReduced();
-                CompactionManager.instance.incrementSstablesDropppedFromCompactions(sstablesRemoved);
+                compactionManager.incrementCompactionsReduced();
+                compactionManager.incrementSstablesDropppedFromCompactions(sstablesRemoved);
             }
         }
     }

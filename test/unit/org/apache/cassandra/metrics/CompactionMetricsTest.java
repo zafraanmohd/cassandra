@@ -20,13 +20,22 @@ package org.apache.cassandra.metrics;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
+import javax.management.AttributeList;
+import javax.management.AttributeNotFoundException;
+import javax.management.JMX;
+import javax.management.ObjectInstance;
+import javax.management.ObjectName;
+
 import com.google.common.collect.Sets;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
@@ -48,10 +57,69 @@ import org.apache.cassandra.utils.FBUtilities;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class CompactionMetricsTest extends CQLTester
 {
     private static final CompactionManager compactionManager = CompactionManager.instance;
+
+    @BeforeClass
+    public static void setup(){
+        try
+        {
+            startJMXServer();
+            createMBeanServerConnection();
+        }
+        catch (Exception e)
+        {
+            e.printStackTrace();
+            fail("Unable to create jmx connection.");
+        }
+    }
+
+    @Test
+    public void basicMetricsTest() throws Throwable {
+
+            /* MBeans to test:
+            org.apache.cassandra.metrics:type=Compaction,name=PendingTasks
+            org.apache.cassandra.metrics:type=Compaction,name=PendingTasksByTableName
+            org.apache.cassandra.metrics:type=Compaction,name=CompletedTasks
+            org.apache.cassandra.metrics:type=Compaction,name=TotalCompactionsCompleted
+            org.apache.cassandra.metrics:type=Compaction,name=BytesCompacted
+            org.apache.cassandra.metrics:type=Compaction,name=CompactionsReduced
+            org.apache.cassandra.metrics:type=Compaction,name=SSTablesDroppedFromCompaction
+            org.apache.cassandra.metrics:type=Compaction,name=CompactionsAborted
+            * */
+
+            Predicate<String> findDomain = domainName -> domainName.equalsIgnoreCase("org.apache.cassandra.metrics");
+            boolean match = Arrays.stream(jmxConnection.getDomains()).anyMatch(findDomain);
+            assertTrue(match);
+
+            try
+            {
+                ObjectName pendingTasks = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=PendingTasks");
+                jmxConnection.getAttribute(pendingTasks, "Value");
+                ObjectName pendingTasksByName = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=PendingTasksByTableName");
+                jmxConnection.getAttribute(pendingTasksByName, "Value");
+                ObjectName completedTasks = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=CompletedTasks");
+                jmxConnection.getAttribute(completedTasks, "Value");
+                ObjectName totalCompactionsCompleted = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=TotalCompactionsCompleted");
+                jmxConnection.getAttribute(totalCompactionsCompleted, "Count");
+                ObjectName bytesCompacted = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=BytesCompacted");
+                jmxConnection.getAttribute(bytesCompacted, "Count");
+                ObjectName compactionsReduced = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=CompactionsReduced");
+                jmxConnection.getAttribute(compactionsReduced, "Count");
+                ObjectName ssTablesDroppedFromCompaction = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=SSTablesDroppedFromCompaction");
+                jmxConnection.getAttribute(ssTablesDroppedFromCompaction, "Count");
+                ObjectName compactionsAborted = new ObjectName("org.apache.cassandra.metrics:type=Compaction,name=CompactionsAborted");
+                jmxConnection.getAttribute(compactionsAborted, "Count");
+            }
+            catch(AttributeNotFoundException attributeNotFoundException){
+                attributeNotFoundException.printStackTrace();
+                fail("MBean not containing the expected attribute.");
+            }
+
+    }
 
     @Test
     public void testSimpleCompactionMetricsForCompletedTasks() throws Throwable
@@ -101,21 +169,6 @@ public class CompactionMetricsTest extends CQLTester
     {
         createTable("create table %s (id int, id2 int, t text, primary key (id, id2))");
         execute("insert into %s (id, id2) values (1, 1)");
-        execute("insert into %s (id, id2) values (2, 2)");
-        execute("insert into %s (id, id2) values (3, 3)");
-        flush();
-        int size = this.execute("select id from %s").size();
-
-        for (int i = 0; i < 10; i++)
-        {
-            execute("delete from %s where id=? and id2=?", i, i);
-        }
-        flush();
-
-        for (int i = 10; i < 20; i++)
-        {
-            execute("delete from %s where id=? and id2=?", i, i);
-        }
         flush();
 
         for(File dir : getCurrentColumnFamilyStore().getDirectories().getCFDirectories()){
@@ -127,31 +180,16 @@ public class CompactionMetricsTest extends CQLTester
             getCurrentColumnFamilyStore().forceMajorCompaction();
         }
         catch (Exception e){
-            logger.info("Exception Thrown when compacting with unwritable directories.");
+            logger.info("Exception will be thrown when compacting with unwritable directories.");
         }
         assertTrue(compactionManager.getMetrics().compactionsAborted.getCount() > 0);
     }
 
     @Test
-    public void testCompactionMetricsForFailedTasks () throws Throwable
+    public void testCompactionMetricsForDroppedSSTables () throws Throwable
     {
-        this.createTable("CREATE TABLE %s (pk int, ck int, a int, b int, PRIMARY KEY (pk, ck))");
-        this.getCurrentColumnFamilyStore().disableAutoCompaction();
-        for (int i = 0; i < 10; ++i)
-        {
-            this.execute("INSERT INTO %s (pk, ck, a, b) VALUES (" + i + ", 2, 3, 4)");
-        }
-
-        Directories dr = getCurrentColumnFamilyStore().getDirectories();
-        for(File dir : dr.getCFDirectories()){
-            logger.info("{} write permission, yes? {}", dir.getAbsolutePath(), !DisallowedDirectories.isUnwritable(dir));
-        }
-
-        this.getCurrentColumnFamilyStore().forceBlockingFlush();
-        this.getCurrentColumnFamilyStore().forceMajorCompaction();
-
-        assertTrue(CompactionManager.instance.getMetrics().compactionsReduced.getCount() > 0);
-        assertTrue(CompactionManager.instance.getMetrics().sstablesDropppedFromCompactions.getCount() > 0);
+        assertTrue(compactionManager.getMetrics().compactionsReduced.getCount() > 0);
+        assertTrue(compactionManager.getMetrics().sstablesDropppedFromCompactions.getCount() > 0);
     }
 
     private List<SSTableReader> createSSTables(ColumnFamilyStore cfs, int count, int startGeneration)
@@ -166,14 +204,6 @@ public class CompactionMetricsTest extends CQLTester
         cfs.disableAutoCompaction();
         cfs.addSSTables(sstables);
         return sstables;
-    }
-
-    private List<CompactionInfo.Holder> getActiveCompactionsForTable(ColumnFamilyStore cfs)
-    {
-        return compactionManager.active.getCompactions()
-                                                .stream()
-                                                .filter(holder -> holder.getCompactionInfo().getTable().orElse("unknown").equalsIgnoreCase(cfs.name))
-                                                .collect(Collectors.toList());
     }
 
     private static class TestCompactionTask
@@ -214,26 +244,6 @@ public class CompactionMetricsTest extends CQLTester
             if (scanners != null)
                 scanners.forEach(ISSTableScanner::close);
             activeCompactions.finishCompaction(ci);
-        }
-
-        protected void dropExpiredSSTables(final Set<SSTableReader> fullyExpiredSSTables)
-        {
-            final Set<SSTableReader> nonExpiredSSTables = Sets.difference(txn.originals(), fullyExpiredSSTables);
-            int nonExpiredSSTablesSize = nonExpiredSSTables.size();
-            int sstablesRemoved = 0;
-
-            while (nonExpiredSSTablesSize > 1)
-            {
-                compactionManager.incrementAborted();
-                nonExpiredSSTablesSize--;
-                sstablesRemoved++;
-            }
-
-            if (sstablesRemoved > 0)
-            {
-                compactionManager.incrementCompactionsReduced();
-                compactionManager.incrementSstablesDropppedFromCompactions(sstablesRemoved);
-            }
         }
     }
 }
